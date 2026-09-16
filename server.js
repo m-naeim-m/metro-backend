@@ -76,7 +76,7 @@ const offlineActivationCodes = {};
 const adsConfig = {};
 
 // ============ Map.ir Key Rotation ============
-const DAILY_LIMIT = 10000; // هر اکانت ۱۰,۰۰۰ درخواست روزانه
+const DAILY_LIMIT = parseInt(process.env.MAP_DAILY_LIMIT || '1000'); // هر اکانت ۱,۰۰۰ درخواست روزانه (map.ir)
 let mapKeys = []; // لیست کلیدها: [{key, dailyCount, lastResetDate, totalUsed}]
 let currentKeyIndex = 0;
 
