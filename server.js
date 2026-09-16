@@ -119,6 +119,42 @@ function incrementKeyUsage(keyObj) {
   saveMapKeyStats();
 }
 
+function getUserFromReq(req) {
+  const token = extractToken(req);
+  const session = sessions[token];
+  return session ? session.phoneNumber : null;
+}
+
+function checkUserMapLimit(phoneNumber) {
+  if (!phoneNumber) return { allowed: true, remaining: USER_MAP_DAILY_LIMIT };
+  const today = getTodayDate();
+  const usage = userMapUsage[phoneNumber];
+  if (!usage || usage.date !== today) {
+    userMapUsage[phoneNumber] = { count: 0, date: today };
+    return { allowed: true, remaining: USER_MAP_DAILY_LIMIT };
+  }
+  const remaining = USER_MAP_DAILY_LIMIT - usage.count;
+  return { allowed: usage.count < USER_MAP_DAILY_LIMIT, remaining: Math.max(0, remaining) };
+}
+
+function incrementUserMapUsage(phoneNumber) {
+  if (!phoneNumber) return;
+  const today = getTodayDate();
+  const usage = userMapUsage[phoneNumber];
+  if (!usage || usage.date !== today) {
+    userMapUsage[phoneNumber] = { count: 1, date: today };
+  } else {
+    usage.count++;
+  }
+}
+
+function saveUserMapUsage() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, 'user_map_usage.json'), JSON.stringify(userMapUsage, null, 2));
+  } catch (err) {}
+}
+
 function saveMapKeyStats() {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -135,7 +171,15 @@ function saveMapKeyStats() {
   }
 }
 
-async function mapRequest(targetUrl) {
+async function mapRequest(targetUrl, phoneNumber) {
+  // بررسی محدودیت روزانه کاربر
+  if (phoneNumber) {
+    const limitCheck = checkUserMapLimit(phoneNumber);
+    if (!limitCheck.allowed) {
+      throw new Error('user_map_daily_limit_reached');
+    }
+  }
+  
   if (mapKeys.length === 0) throw new Error('map_keys_not_configured');
   
   let lastError = null;
@@ -160,6 +204,7 @@ async function mapRequest(targetUrl) {
       // اگه موفق بود
       if (response.status === 200 || response.status === 201) {
         incrementKeyUsage(keyObj);
+        if (phoneNumber) incrementUserMapUsage(phoneNumber);
         return response;
       }
       
@@ -514,18 +559,53 @@ app.post('/admin/config/ads', (req, res) => {
   jsonResponse(res, 200, { message: 'ok' });
 });
 
+// GET /map/usage - نمایش مصرف نقشه کاربر
+app.get('/map/usage', (req, res) => {
+  const phoneNumber = getUserFromReq(req);
+  const limitCheck = checkUserMapLimit(phoneNumber);
+  jsonResponse(res, 200, {
+    phoneNumber: phoneNumber || 'anonymous',
+    dailyLimit: USER_MAP_DAILY_LIMIT,
+    remaining: limitCheck.remaining,
+    used: USER_MAP_DAILY_LIMIT - limitCheck.remaining,
+  });
+});
+
+// GET /admin/map-usage - آمار مصرف نقشه همه کاربران (ادمین)
+app.get('/admin/map-usage', (req, res) => {
+  if (!isAdmin(req)) return adminUnauthorized(res);
+  const today = getTodayDate();
+  const usageList = Object.entries(userMapUsage)
+    .filter(([_, u]) => u.date === today)
+    .map(([phone, u]) => ({
+      phoneNumber: phone.substring(0, 4) + '***' + phone.substring(7),
+      used: u.count,
+      remaining: Math.max(0, USER_MAP_DAILY_LIMIT - u.count),
+    }))
+    .sort((a, b) => b.used - a.used);
+  jsonResponse(res, 200, {
+    dailyLimit: USER_MAP_DAILY_LIMIT,
+    totalUsers: usageList.length,
+    users: usageList,
+  });
+});
+
 // ====================== MAP PROXY ======================
 
 // GET /map/tiles/:z/:x/:y.png
 app.get('/map/tiles/:z/:x/:y.png', async (req, res) => {
   try {
     const { z, x, y } = req.params;
+    const phoneNumber = getUserFromReq(req);
     const targetUrl = `https://map.ir/shiveh/xyz/1.0.0/Shiveh:Shiveh@EPSG:3857@png/${z}/${x}/${y}.png`;
-    const response = await mapRequest(targetUrl);
+    const response = await mapRequest(targetUrl, phoneNumber);
     const buffer = await response.buffer();
     res.set({ 'Content-Type': response.headers.get('content-type') || 'image/png', 'Cache-Control': 'public, max-age=300' });
     res.send(buffer);
   } catch (err) {
+    if (err.message === 'user_map_daily_limit_reached') {
+      return jsonResponse(res, 429, { message: 'map_daily_limit_reached', limit: USER_MAP_DAILY_LIMIT });
+    }
     jsonResponse(res, 503, { message: 'map_unavailable' });
   }
 });
@@ -535,11 +615,15 @@ app.get('/map/foot', async (req, res) => {
   const { origin, destination } = req.query;
   if (!origin || !destination) return jsonResponse(res, 400, { message: 'invalid_map_request' });
   try {
-    const response = await mapRequest(`https://map.ir/routes/foot/v1/driving/${origin};${destination}`);
+    const phoneNumber = getUserFromReq(req);
+    const response = await mapRequest(`https://map.ir/routes/foot/v1/driving/${origin};${destination}`, phoneNumber);
     const body = await response.text();
     res.set({ 'Content-Type': response.headers.get('content-type') || 'application/json', 'Cache-Control': 'public, max-age=300' });
     res.send(body);
   } catch (err) {
+    if (err.message === 'user_map_daily_limit_reached') {
+      return jsonResponse(res, 429, { message: 'map_daily_limit_reached', limit: USER_MAP_DAILY_LIMIT });
+    }
     jsonResponse(res, 503, { message: 'map_unavailable' });
   }
 });
@@ -613,6 +697,15 @@ adsConfig.interstitialZoneId = (process.env.TAPSELL_INTERSTITIAL_ZONE_ID || '').
 
 loadReportData();
 
+// بارگذاری مصرف نقشه کاربران از دیسک
+try {
+  const usageFile = path.join(DATA_DIR, 'user_map_usage.json');
+  if (fs.existsSync(usageFile)) {
+    const usageData = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+    Object.assign(userMapUsage, usageData);
+  }
+} catch (err) {}
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Metro Backend running on port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/health`);
@@ -620,5 +713,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Verify: POST /auth/verify-otp`);
   console.log(`   Admin:  GET  /admin/reports/users`);
   console.log(`   Map Keys: ${mapKeys.length} key(s) loaded`);
-  console.log(`   Daily Limit per Key: ${DAILY_LIMIT} requests\n`);
+  console.log(`   Daily Limit per Key: ${DAILY_LIMIT} requests`);
+  console.log(`   User Map Daily Limit: ${USER_MAP_DAILY_LIMIT} requests\n`);
 });
