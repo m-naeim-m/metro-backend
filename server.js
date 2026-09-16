@@ -75,9 +75,116 @@ const offlineSubscriptions = {};
 const offlineActivationCodes = {};
 const adsConfig = {};
 
-let mapKeys = [];
-let mapKeyIndex = 0;
+// ============ Map.ir Key Rotation ============
+const DAILY_LIMIT = 10000; // هر اکانت ۱۰,۰۰۰ درخواست روزانه
+let mapKeys = []; // لیست کلیدها: [{key, dailyCount, lastResetDate, totalUsed}]
+let currentKeyIndex = 0;
 
+function getTodayDate() {
+  return new Date().toISOString().split('T')[0]; // مثال: "2026-09-16"
+}
+
+function resetDailyCountersIfNeeded() {
+  const today = getTodayDate();
+  for (const keyObj of mapKeys) {
+    if (keyObj.lastResetDate !== today) {
+      console.log(`🔄 Resetting daily counter for key: ${keyObj.key.substring(0, 8)}...`);
+      keyObj.dailyCount = 0;
+      keyObj.lastResetDate = today;
+    }
+  }
+}
+
+function getNextMapKey() {
+  if (mapKeys.length === 0) return null;
+  
+  resetDailyCountersIfNeeded();
+  
+  // اول کلیدی رو پیدا کن که به حد روزانه نرسیده
+  for (let i = 0; i < mapKeys.length; i++) {
+    const idx = (currentKeyIndex + i) % mapKeys.length;
+    if (mapKeys[idx].dailyCount < DAILY_LIMIT) {
+      currentKeyIndex = (idx + 1) % mapKeys.length;
+      return mapKeys[idx];
+    }
+  }
+  
+  // همه کلیدها به حد رسیدن
+  return null;
+}
+
+function incrementKeyUsage(keyObj) {
+  keyObj.dailyCount++;
+  keyObj.totalUsed++;
+  saveMapKeyStats();
+}
+
+function saveMapKeyStats() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    const statsFile = path.join(DATA_DIR, 'map_key_stats.json');
+    const stats = mapKeys.map(k => ({
+      keyPrefix: k.key.substring(0, 12) + '...',
+      dailyCount: k.dailyCount,
+      totalUsed: k.totalUsed,
+      lastResetDate: k.lastResetDate,
+    }));
+    fs.writeFileSync(statsFile, JSON.stringify(stats, null, 2));
+  } catch (err) {
+    console.error('Stats save failed:', err.message);
+  }
+}
+
+async function mapRequest(targetUrl) {
+  if (mapKeys.length === 0) throw new Error('map_keys_not_configured');
+  
+  let lastError = null;
+  
+  // تمام کلیدها رو امتحان کن
+  for (let attempt = 0; attempt < mapKeys.length; attempt++) {
+    const keyObj = getNextMapKey();
+    if (!keyObj) {
+      throw new Error('all_keys_daily_limit_reached');
+    }
+    
+    try {
+      const response = await fetch(targetUrl, {
+        headers: { 
+          'x-api-key': keyObj.key, 
+          'Authorization': `Bearer ${keyObj.key}`, 
+          'Accept': '*/*' 
+        },
+        timeout: 20000,
+      });
+      
+      // اگه موفق بود
+      if (response.status === 200 || response.status === 201) {
+        incrementKeyUsage(keyObj);
+        return response;
+      }
+      
+      // اگه rate limit خورده (429) یا unauthorized (401/403)
+      if (response.status === 429 || response.status === 401 || response.status === 403) {
+        console.log(`⚠️ Key ${keyObj.key.substring(0, 8)}... failed with status ${response.status}`);
+        lastError = `status_${response.status}`;
+        continue; // کلید بعدی رو امتحان کن
+      }
+      
+      // خطای دیگه
+      incrementKeyUsage(keyObj);
+      return response;
+      
+    } catch (err) {
+      console.log(`⚠️ Key ${keyObj.key.substring(0, 8)}... network error: ${err.message}`);
+      lastError = err.message;
+      continue;
+    }
+  }
+  
+  throw new Error(`map_all_keys_failed: ${lastError}`);
+}
+
+// ============ Map Key Management ============
 function loadReportData() {
   try {
     if (!fs.existsSync(DATA_FILE)) return;
@@ -131,38 +238,91 @@ async function sendSms(phone, code) {
   }
 }
 
-// ============ Map Proxy ============
-function getNextMapKey() {
-  if (mapKeys.length === 0) return '';
-  const key = mapKeys[mapKeyIndex % mapKeys.length];
-  mapKeyIndex = (mapKeyIndex + 1) % mapKeys.length;
-  return key;
-}
-
-async function mapRequest(targetUrl) {
-  if (mapKeys.length === 0) throw new Error('map_keys_not_configured');
-  let lastStatus = 503;
-  for (let i = 0; i < mapKeys.length; i++) {
-    const key = getNextMapKey();
-    const response = await fetch(targetUrl, {
-      headers: { 'x-api-key': key, 'Authorization': `Bearer ${key}`, 'Accept': '*/*' },
-      timeout: 20000,
-    });
-    lastStatus = response.status;
-    if (response.status !== 401 && response.status !== 403 && response.status !== 429) {
-      return response;
-    }
-  }
-  throw new Error(`map_all_keys_failed status=${lastStatus}`);
-}
-
 // ================================================================
 //                         ROUTES
 // ================================================================
 
 // ====================== HEALTH ======================
 app.get('/health', (req, res) => {
-  jsonResponse(res, 200, { status: 'ok', message: 'OTP backend is running' });
+  resetDailyCountersIfNeeded();
+  jsonResponse(res, 200, { 
+    status: 'ok', 
+    message: 'OTP backend is running',
+    mapKeysCount: mapKeys.length,
+    mapKeysStatus: mapKeys.map(k => ({
+      prefix: k.key.substring(0, 8) + '...',
+      dailyUsed: k.dailyCount,
+      dailyRemaining: DAILY_LIMIT - k.dailyCount,
+      totalUsed: k.totalUsed,
+    })),
+  });
+});
+
+// ====================== MAP KEY STATS ======================
+app.get('/admin/map-keys', (req, res) => {
+  if (!isAdmin(req)) return adminUnauthorized(res);
+  resetDailyCountersIfNeeded();
+  jsonResponse(res, 200, {
+    keys: mapKeys.map((k, idx) => ({
+      index: idx,
+      prefix: k.key.substring(0, 12) + '...',
+      dailyUsed: k.dailyCount,
+      dailyRemaining: DAILY_LIMIT - k.dailyCount,
+      dailyLimit: DAILY_LIMIT,
+      totalUsed: k.totalUsed,
+      lastResetDate: k.lastResetDate,
+      isCurrent: idx === currentKeyIndex,
+    })),
+    currentIndex: currentKeyIndex,
+    totalKeys: mapKeys.length,
+  });
+});
+
+// POST /admin/map-keys - اضافه کردن کلید جدید
+app.post('/admin/map-keys', (req, res) => {
+  if (!isAdmin(req)) return adminUnauthorized(res);
+  const { key } = req.body;
+  if (!key || typeof key !== 'string' || key.trim().length < 10) {
+    return jsonResponse(res, 400, { message: 'invalid_key' });
+  }
+  const trimmed = key.trim();
+  if (mapKeys.some(k => k.key === trimmed)) {
+    return jsonResponse(res, 409, { message: 'key_already_exists' });
+  }
+  mapKeys.push({
+    key: trimmed,
+    dailyCount: 0,
+    lastResetDate: getTodayDate(),
+    totalUsed: 0,
+  });
+  console.log(`✅ Map key added: ${trimmed.substring(0, 8)}...`);
+  jsonResponse(res, 201, { message: 'ok', keysCount: mapKeys.length });
+});
+
+// DELETE /admin/map-keys/:index - حذف کلید
+app.delete('/admin/map-keys/:index', (req, res) => {
+  if (!isAdmin(req)) return adminUnauthorized(res);
+  const idx = parseInt(req.params.index);
+  if (isNaN(idx) || idx < 0 || idx >= mapKeys.length) {
+    return jsonResponse(res, 400, { message: 'invalid_index' });
+  }
+  const removed = mapKeys.splice(idx, 1)[0];
+  if (currentKeyIndex >= mapKeys.length) {
+    currentKeyIndex = 0;
+  }
+  console.log(`🗑️ Map key removed: ${removed.key.substring(0, 8)}...`);
+  jsonResponse(res, 200, { message: 'ok', keysCount: mapKeys.length });
+});
+
+// POST /admin/map-keys/reset - ریست شمارنده روزانه
+app.post('/admin/map-keys/reset', (req, res) => {
+  if (!isAdmin(req)) return adminUnauthorized(res);
+  for (const k of mapKeys) {
+    k.dailyCount = 0;
+    k.lastResetDate = getTodayDate();
+  }
+  console.log('🔄 Daily counters reset');
+  jsonResponse(res, 200, { message: 'ok' });
 });
 
 // ====================== AUTH ======================
@@ -270,7 +430,7 @@ app.post('/auth/logout', (req, res) => {
 
 // ====================== SMS ======================
 
-// POST /sms/send-otp  (client-side SMS send, separate from auth flow)
+// POST /sms/send-otp
 app.post('/sms/send-otp', async (req, res) => {
   try {
     const { phoneNumber, code, senderNumber, patternBodyId } = req.body;
@@ -436,7 +596,17 @@ app.use((err, req, res, next) => {
 // ================================================================
 //                         START
 // ================================================================
-mapKeys = (process.env.MAP_IR_API_KEYS || process.env.MAP_IR_API_KEY || '').split(',').map(k => k.trim()).filter(k => k);
+
+// بارگذاری کلیدهای Map.ir از متغیر محیطی
+// فرمت: کلید1,کلید2,کلید3 (با کاما جدا شده)
+const rawMapKeys = (process.env.MAP_IR_API_KEYS || process.env.MAP_IR_API_KEY || '').split(',').map(k => k.trim()).filter(k => k);
+mapKeys = rawMapKeys.map(key => ({
+  key,
+  dailyCount: 0,
+  lastResetDate: getTodayDate(),
+  totalUsed: 0,
+}));
+
 adsConfig.appId = (process.env.TAPSELL_APP_ID || '').trim();
 adsConfig.bannerZoneId = (process.env.TAPSELL_BANNER_ZONE_ID || '').trim();
 adsConfig.interstitialZoneId = (process.env.TAPSELL_INTERSTITIAL_ZONE_ID || '').trim();
@@ -448,5 +618,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Health: http://localhost:${PORT}/health`);
   console.log(`   OTP:    POST /auth/request-otp`);
   console.log(`   Verify: POST /auth/verify-otp`);
-  console.log(`   Admin:  GET  /admin/reports/users\n`);
+  console.log(`   Admin:  GET  /admin/reports/users`);
+  console.log(`   Map Keys: ${mapKeys.length} key(s) loaded`);
+  console.log(`   Daily Limit per Key: ${DAILY_LIMIT} requests\n`);
 });
